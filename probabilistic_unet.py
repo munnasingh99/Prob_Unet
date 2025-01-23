@@ -21,7 +21,7 @@ class Encoder(nn.Module):
 
         if posterior:
             #To accomodate for the mask that is concatenated at the channel axis, we increase the input_channels.
-            self.input_channels += 2
+            self.input_channels += 1
 
         layers = []
         for i in range(len(self.num_filters)):
@@ -83,6 +83,7 @@ class AxisAlignedConvGaussian(nn.Module):
         if segm is not None:
             self.show_img = input
             self.show_seg = segm
+            print(input.shape,seg.shape)
             input = torch.cat((input, segm), dim=1)
             self.show_concat = input
             self.sum_input = torch.sum(input)
@@ -187,7 +188,7 @@ class ProbabilisticUnet(nn.Module):
     no_cons_per_block: no convs per block in the (convolutional) encoder of prior and posterior
     """
 
-    def __init__(self, input_channels=1, num_classes=2, num_filters=[32,64,128,192], latent_dim=6, no_convs_fcomb=4, beta=10.0):
+    def __init__(self, input_channels=1, num_classes=1, num_filters=[32,64,128,192], latent_dim=6, no_convs_fcomb=4, beta=10.0):
         super(ProbabilisticUnet, self).__init__()
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -209,11 +210,10 @@ class ProbabilisticUnet(nn.Module):
         Construct prior latent space for patch and run patch through UNet,
         in case training is True also construct posterior latent space
         """
-        combined_segm = torch.cat([segm[0].unsqueeze(1), segm[1].unsqueeze(1)], dim=1)
         if training:
-            self.posterior_latent_space = self.posterior.forward(patch, combined_segm)
+            self.posterior_latent_space = self.posterior.forward(patch, segm)
         self.prior_latent_space = self.prior.forward(patch)
-        self.unet_features = self.unet.forward(patch, False)
+        self.unet_features = self.unet.forward(patch,False)
 
     def sample(self, testing=False):
         """
