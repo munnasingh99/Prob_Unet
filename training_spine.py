@@ -2,11 +2,29 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from datagen import DataGeneratorDataset
-from probabilistic_unet import ProbabilisticUnet
+from test_train import ProbabilisticUnet
 from utils import l2_regularisation
 from tqdm import tqdm
 import os
+import wandb
 
+# Initialize wandb
+wandb.init(
+    project="probabilistic-unet",
+    config={
+        "epochs": 50,
+        "batch_size": 16,
+        "learning_rate": 1e-5,
+        "weight_decay": 1e-4,
+        "latent_dim": 12,
+        "beta": 20,
+        "num_filters": [32, 64, 128, 192],
+    },
+)
+config = wandb.config
+train_loss=[]
+val_loss=[]
+dice_score=[]
 # Set up device for training
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -28,23 +46,31 @@ val_dataset = DataGeneratorDataset(
 )
 
 # Create data loaders
-train_loader = DataLoader(train_dataset, batch_size=64, num_workers=4, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=64, num_workers=4, pin_memory=True)
+train_loader = DataLoader(train_dataset, batch_size=config.batch_size, num_workers=4, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=config.batch_size, num_workers=4, pin_memory=True)
 
 # Initialize the network
 net = ProbabilisticUnet(
     input_channels=1,
     num_classes=1,
-    num_filters=[32, 64, 128, 192],
-    latent_dim=6,
+    num_filters=config.num_filters,
+    latent_dim=config.latent_dim,
     no_convs_fcomb=4,
-    beta=20,
+    beta=config.beta,
 )
 net.to(device)
 
 # Setup optimizer
-optimizer = torch.optim.Adam(net.parameters(), lr=1e-4, weight_decay=1e-5)
+optimizer = torch.optim.Adam(net.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+def piecewise_constant_lr(epoch, boundaries, values):
+    for i in range(len(boundaries)):
+        if epoch < boundaries[i]:
+            return values[i]
+    return values[-1]
 
+boundaries = [80, 160, 240]
+values = [1e-5,0.5e-5,1e-6, 0.5e-6]
+scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: piecewise_constant_lr(epoch, boundaries, values))
 # Create directory for saving models
 save_dir = 'model_checkpoints'
 os.makedirs(save_dir, exist_ok=True)
@@ -57,7 +83,7 @@ def dice_coefficient(pred, target, smooth=1e-5):
     return (2. * intersection + smooth) / (pred.sum() + target.sum() + smooth)
 
 # Training and validation loop
-epochs = 10
+epochs = config.epochs
 best_val_loss = float('inf')
 
 for epoch in range(epochs):
@@ -90,9 +116,13 @@ for epoch in range(epochs):
         epoch_loss += loss.item()
         batch_count += 1
         train_pbar.set_postfix({'avg_loss': f'{(epoch_loss / batch_count):.4f}'})
-
+    scheduler.step()
     avg_epoch_loss = epoch_loss / batch_count
+    train_loss.append(avg_epoch_loss)
     print(f"Epoch {epoch+1} Training Loss: {avg_epoch_loss:.4f}")
+
+    # Log training loss to wandb
+    wandb.log({"Train Loss": avg_epoch_loss, "Epoch": epoch + 1})
 
     # Validation loop
     net.eval()
@@ -119,13 +149,27 @@ for epoch in range(epochs):
 
     avg_val_loss = val_loss / len(val_loader)
     avg_dice_score = dice_score / len(val_loader)
+    val_loss.append(avg_val_loss)
+    dice_score.append(avg_dice_score)
     print(f"Validation Loss: {avg_val_loss:.4f}, Dice Coefficient: {avg_dice_score:.4f}")
+
+    # Log validation loss and dice score to wandb
+    wandb.log({
+        "Validation Loss": avg_val_loss,
+        "Dice Coefficient": avg_dice_score,
+        "Epoch": epoch + 1,
+    })
 
     # Save the model if validation loss improves
     if avg_val_loss < best_val_loss:
         best_val_loss = avg_val_loss
-        save_path = os.path.join(save_dir, f'best_model_epoch_{epoch+1}_loss_{avg_val_loss:.4f}.pth')
+        save_path = os.path.join(save_dir, f'best_model_spine_t_epoch_{epoch+1}_loss_{avg_val_loss:.4f}.pth')
         torch.save(net.state_dict(), save_path)
         print(f"Saved best model checkpoint to: {save_path}")
 
+loss_file = os.path.join(save_dir, 'losses_1.json')
+with open(loss_file, 'w') as f:
+    json.dump({'train_losses': epoch_losses, 'val_losses': val_losses,'dice_scores': dice_scores }, f)
+wandb.save(loss_file)
 print("Training completed!")
+wandb.finish()

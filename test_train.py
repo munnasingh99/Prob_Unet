@@ -91,10 +91,12 @@ class AxisAlignedConvGaussian(nn.Module):
         encoding = self.encoder(input)
         self.show_enc = encoding
 
+        #print(encoding.shape)
         #We only want the mean of the resulting hxw image
         encoding = torch.mean(encoding, dim=2, keepdim=True)
+        #print(encoding.shape)
         encoding = torch.mean(encoding, dim=3, keepdim=True)
-
+        #print(encoding.shape)
         #Convert encoding to 2 x latent dim and split up for mu and log_sigma
         mu_log_sigma = self.conv_layer(encoding)
 
@@ -263,7 +265,7 @@ class ProbabilisticUnet(nn.Module):
         Returns:
             torch.Tensor: Reconstructed segmentation map.
         """
-        if self.posterior_latent_space is not None:
+        if training == True and self.posterior_latent_space is not None:
             # Training mode: Use posterior latent space
             if use_posterior_mean:
                 z_posterior = self.posterior_latent_space.loc
@@ -273,7 +275,7 @@ class ProbabilisticUnet(nn.Module):
             # Testing mode: Fall back to prior latent space
             print("Warning: Posterior latent space unavailable. Falling back to prior latent space.")
             z_posterior = self.prior_latent_space.rsample()
-
+        #print("Here")
         # Use the sampled latent variable to reconstruct the segmentation
         return self.fcomb.forward(self.unet_features, z_posterior)
 
@@ -295,27 +297,65 @@ class ProbabilisticUnet(nn.Module):
             #print(f"KL Divergence (Sampled): {kl_div}")
         return kl_div
 
-    def elbo(self, segm, analytic_kl=True, reconstruct_posterior_mean=False):
+    def elbo(self, segm=None, analytic_kl=True, reconstruct_posterior_mean=False, training=True):
         """
-        Calculate the evidence lower bound of the log-likelihood of P(Y|X)
+        Calculate the evidence lower bound (ELBO) of the log-likelihood of P(Y|X).
+
+        Args:
+            segm (torch.Tensor or None): Ground truth segmentation mask. Required in training.
+            analytic_kl (bool): Use analytical KL divergence if True.
+            reconstruct_posterior_mean (bool): Use mean of posterior latent space for reconstruction.
+            training (bool): Whether the model is in training mode.
+
+        Returns:
+            torch.Tensor: The ELBO loss (negative evidence lower bound).
         """
+        if training:
+            # Ensure both posterior and prior latent spaces are initialized
+            if self.posterior_latent_space is None or self.prior_latent_space is None:
+                raise ValueError("Latent spaces (posterior or prior) are not initialized. Run the forward pass first.")
 
-        criterion = nn.BCEWithLogitsLoss(size_average = False, reduce=False, reduction=None)
-        z_posterior = self.posterior_latent_space.rsample()
-        
-        self.kl = torch.mean(self.kl_divergence(analytic=analytic_kl, calculate_posterior=False, z_posterior=z_posterior))
+            # Sample z from the posterior latent space
+            z_posterior = self.posterior_latent_space.rsample()
 
-        #Here we use the posterior sample sampled above
-        self.reconstruction = self.reconstruct(use_posterior_mean=reconstruct_posterior_mean, calculate_posterior=False, z_posterior=z_posterior)
-        
-        reconstruction_loss = criterion(input=self.reconstruction, target=segm)
-        #print(reconstruction_loss)
-        epsilon = 1e-7 # Add a small epsilon
-        self.reconstruction_loss = torch.sum(reconstruction_loss + epsilon) # Sum after adding epsilon
-        self.mean_reconstruction_loss = torch.mean(reconstruction_loss + epsilon) # Average after adding epsilon
-        #print(self.reconstruction_loss)
+            # Calculate KL divergence
+            self.kl = torch.mean(self.kl_divergence(analytic=analytic_kl, calculate_posterior=False, z_posterior=z_posterior))
 
+            # Reconstruct segmentation using posterior sample
+            self.reconstruction = self.reconstruct(
+                use_posterior_mean=reconstruct_posterior_mean, calculate_posterior=False, z_posterior=z_posterior, training=training
+            )
+        else:
+            # Validation/Testing: Use the prior latent space
+            if self.prior_latent_space is None:
+                raise ValueError("Prior latent space is not initialized. Run the forward pass first.")
+
+            # Sample z from the prior latent space
+            z_prior = self.prior_latent_space.rsample()
+
+            # During validation/testing, no KL divergence is calculated
+            self.kl = torch.tensor(0.0, device=z_prior.device)
+
+            # Reconstruct segmentation using prior sample
+            self.reconstruction = self.reconstruct(
+                use_posterior_mean=False, calculate_posterior=False, z_posterior=z_prior, training=False
+            )
+
+        # Binary cross-entropy loss for reconstruction
+        criterion = nn.BCEWithLogitsLoss(reduction='none')
+        if segm is not None:
+            reconstruction_loss = criterion(input=self.reconstruction, target=segm)
+        else:
+            raise ValueError("Ground truth segmentation mask (segm) is required for ELBO computation.")
+
+        # Prevent NaN in loss with epsilon stabilization
+        epsilon = 1e-7
+        self.reconstruction_loss = torch.sum(reconstruction_loss + epsilon)  # Sum loss
+        self.mean_reconstruction_loss = torch.mean(reconstruction_loss + epsilon)  # Mean loss
+
+        # ELBO = Reconstruction loss + KL divergence (weighted by beta)
         return -(self.reconstruction_loss + self.beta * self.kl)
+
 
 def debug_hook(grad):
         print("Grad Norm:", grad.norm())

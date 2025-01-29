@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 class DataGeneratorDataset(Dataset):
     def __init__(self, fn, samples_per_epoch=50000, size=(1, 128, 128), 
                  target_resolution=None, augment=True, shuffle=True, 
-                 seed=42, normalize=[-1, 1], min_content=0.):
+                 seed=42, normalize=[0, 1], min_content=50):
         """Data Generator for PyTorch training.
 
         Args:
