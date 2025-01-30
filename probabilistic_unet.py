@@ -36,10 +36,12 @@ class Encoder(nn.Module):
                 layers.append(nn.AvgPool2d(kernel_size=2, stride=2, padding=0, ceil_mode=True))
             
             layers.append(nn.Conv2d(input_dim, output_dim, kernel_size=3, padding=int(padding)))
+            layers.append(nn.BatchNorm2d(output_dim)) 
             layers.append(nn.ReLU(inplace=True))
 
             for _ in range(no_convs_per_block-1):
                 layers.append(nn.Conv2d(output_dim, output_dim, kernel_size=3, padding=int(padding)))
+                layers.append(nn.BatchNorm2d(output_dim))
                 layers.append(nn.ReLU(inplace=True))
 
         self.layers = nn.Sequential(*layers)
@@ -104,6 +106,7 @@ class AxisAlignedConvGaussian(nn.Module):
 
         mu = mu_log_sigma[:,:self.latent_dim]
         log_sigma = mu_log_sigma[:,self.latent_dim:]
+        log_sigma = torch.clamp(log_sigma, min=-10, max=10)
 
         # Debugging mean and log variance
         #print(f"{self.name} Latent Space:")
@@ -115,7 +118,8 @@ class AxisAlignedConvGaussian(nn.Module):
 
         #This is a multivariate normal with diagonal covariance matrix sigma
         #https://github.com/pytorch/pytorch/pull/11178
-        dist = Independent(Normal(loc=mu, scale=torch.exp(log_sigma)),1)
+        #dist = Independent(Normal(loc=mu, scale=torch.exp(log_sigma)),1)
+        dist = Independent(Normal(loc=mu, scale=torch.exp(log_sigma + 1e-6)), 1) 
         return dist
 
 class Fcomb(nn.Module):
@@ -196,7 +200,7 @@ class ProbabilisticUnet(nn.Module):
     no_cons_per_block: no convs per block in the (convolutional) encoder of prior and posterior
     """
 
-    def __init__(self, input_channels=1, num_classes=1, num_filters=[32,64,128,192], latent_dim=6, no_convs_fcomb=4, beta=10.0):
+    def __init__(self, input_channels=1, num_classes=1, num_filters=[32,64,128,192], latent_dim=6, no_convs_fcomb=4, beta=1):
         super(ProbabilisticUnet, self).__init__()
         self.input_channels = input_channels
         self.num_classes = num_classes
@@ -223,12 +227,19 @@ class ProbabilisticUnet(nn.Module):
         """
         if training:
             self.posterior_latent_space = self.posterior.forward(patch, segm)
+            print(f"Posterior Mean: {self.posterior_latent_space.base_dist.loc.mean().item()}, Posterior Std: {self.posterior_latent_space.base_dist.scale.mean().item()}")
             #print(f"Posterior Latent Space - Mean: {self.posterior_latent_space.base_dist.loc}")
             #print(f"Posterior Latent Space - Scale: {self.posterior_latent_space.base_dist.scale}")
 
         self.prior_latent_space = self.prior.forward(patch)
         #print(f"Prior Latent Space - Mean: {self.prior_latent_space.base_dist.loc}")
         #print(f"Prior Latent Space - Scale: {self.prior_latent_space.base_dist.scale}")
+        print(f"Prior Mean: {self.prior_latent_space.base_dist.loc.mean().item()}, Prior Std: {self.prior_latent_space.base_dist.scale.mean().item()}")
+        if torch.isnan(self.prior_latent_space.base_dist.loc).any():
+            print("NaN detected in prior latent space mean!")
+
+        if training and torch.isnan(self.posterior_latent_space.base_dist.loc).any():
+            print(" NaN detected in posterior latent space mean!")
 
         self.unet_features = self.unet.forward(patch, False)
 
@@ -300,7 +311,7 @@ class ProbabilisticUnet(nn.Module):
         Calculate the evidence lower bound of the log-likelihood of P(Y|X)
         """
 
-        criterion = nn.BCEWithLogitsLoss(size_average = False, reduce=False, reduction=None)
+        criterion = nn.BCEWithLogitsLoss(reduction='sum')
         z_posterior = self.posterior_latent_space.rsample()
         
         self.kl = torch.mean(self.kl_divergence(analytic=analytic_kl, calculate_posterior=False, z_posterior=z_posterior))

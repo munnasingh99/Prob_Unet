@@ -2,36 +2,37 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from datagen import DataGeneratorDataset
-from test_train import ProbabilisticUnet
+from probabilistic_unet import ProbabilisticUnet
 from utils import l2_regularisation
 from tqdm import tqdm
 import os
 import wandb
-
+from torch.optim.lr_scheduler import LambdaLR
+import json
 # Initialize wandb
 wandb.init(
     project="probabilistic-unet",
     config={
-        "epochs": 50,
+        "epochs": 3,
         "batch_size": 16,
-        "learning_rate": 1e-5,
+        "learning_rate": 5e-5,
         "weight_decay": 1e-4,
         "latent_dim": 12,
-        "beta": 20,
+        "beta": 5,
         "num_filters": [32, 64, 128, 192],
     },
 )
 config = wandb.config
 train_loss=[]
-val_loss=[]
-dice_score=[]
+vali_losses=[]
+dice_scores=[]
 # Set up device for training
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Initialize datasets
 train_dataset = DataGeneratorDataset(
     r"DeepD3_Training.d3set",
-    samples_per_epoch=256*256,
+    samples_per_epoch=256*8,
     size=(1, 128, 128),
     augment=True,
     shuffle=True,
@@ -69,8 +70,8 @@ def piecewise_constant_lr(epoch, boundaries, values):
     return values[-1]
 
 boundaries = [80, 160, 240]
-values = [1e-5,0.5e-5,1e-6, 0.5e-6]
-scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: piecewise_constant_lr(epoch, boundaries, values))
+values = [1e-4, 0.5e-4, 1e-5, 0.5e-6]
+#scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: piecewise_constant_lr(epoch, boundaries, values))
 # Create directory for saving models
 save_dir = 'model_checkpoints'
 os.makedirs(save_dir, exist_ok=True)
@@ -110,13 +111,20 @@ for epoch in range(epochs):
 
         # Optimization step
         optimizer.zero_grad()
+        kl_val = net.kl_divergence(analytic=True).mean().item()
+        print(f"KL Divergence: {kl_val}")
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)  # Clipping gradients to prevent explosion
         loss.backward()
+        for name, param in net.named_parameters():
+            if param.grad is not None and torch.isnan(param.grad).any():
+                print(f"NaN detected in gradients of {name}")
+
         optimizer.step()
 
         epoch_loss += loss.item()
         batch_count += 1
         train_pbar.set_postfix({'avg_loss': f'{(epoch_loss / batch_count):.4f}'})
-    scheduler.step()
+    #scheduler.step()
     avg_epoch_loss = epoch_loss / batch_count
     train_loss.append(avg_epoch_loss)
     print(f"Epoch {epoch+1} Training Loss: {avg_epoch_loss:.4f}")
@@ -144,13 +152,16 @@ for epoch in range(epochs):
             val_loss += loss.item()
 
             # Dice coefficient
-            predictions = net.sample()
+            #predictions = net.sample()
+            predictions = torch.sigmoid(net.sample())  # Convert logits to probabilities
+            predictions = (predictions > 0.5).float()  # Threshold
+
             dice_score += dice_coefficient(predictions, mask).item()
 
     avg_val_loss = val_loss / len(val_loader)
     avg_dice_score = dice_score / len(val_loader)
-    val_loss.append(avg_val_loss)
-    dice_score.append(avg_dice_score)
+    vali_losses.append(avg_val_loss)
+    dice_scores.append(avg_dice_score)
     print(f"Validation Loss: {avg_val_loss:.4f}, Dice Coefficient: {avg_dice_score:.4f}")
 
     # Log validation loss and dice score to wandb
@@ -169,7 +180,7 @@ for epoch in range(epochs):
 
 loss_file = os.path.join(save_dir, 'losses_1.json')
 with open(loss_file, 'w') as f:
-    json.dump({'train_losses': epoch_losses, 'val_losses': val_losses,'dice_scores': dice_scores }, f)
+    json.dump({'train_loss': train_loss, 'val_losses': vali_losses,'dice_scores': dice_scores }, f)
 wandb.save(loss_file)
 print("Training completed!")
 wandb.finish()
