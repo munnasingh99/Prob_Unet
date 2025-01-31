@@ -10,6 +10,7 @@ from datagen import DataGeneratorDataset
 from probabilistic_unet import ProbabilisticUnet
 import wandb
 
+torch.manual_seed(42)
 wandb.init(
     project="probabilistic-unet",
     config={
@@ -20,7 +21,7 @@ wandb.init(
         "beta": 1
     },
 )
-
+config=wandb.config
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Output directory for saving predictions & models
@@ -53,7 +54,7 @@ val_loader = DataLoader(val_dataset, batch_size=config.batch_size, num_workers=4
 # Define model, loss, and optimizer
 model = ProbabilisticUnet(input_channels=1, num_classes=1, latent_dim=config.latent_dim).to(device)
 criterion = nn.BCEWithLogitsLoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
 
 # Best validation dice score tracking
 best_val_dice = 0.0
@@ -158,7 +159,7 @@ for epoch in range(config.epochs):
             image, mask = image.to(device), spine_mask.to(device)
 
             # Forward pass
-            model.forward(image, training=False)
+            model.forward(image,mask, training=False)
             kl_div = model.kl_divergence()
             pred_logits = model.sample()
             recon_loss = criterion(pred_logits, mask)
@@ -193,12 +194,12 @@ for epoch in range(config.epochs):
     avg_train_kl = epoch_kl / len(train_loader)
     avg_train_dice = epoch_dice / len(train_loader)
 
-    wandb.log({"Train Loss": avg_train_loss,"Train_KL_Loss":avg_train_kl, "Train_Dice_Loss":avg_train_dice "Epoch": epoch + 1})
+    wandb.log({"Train Loss": avg_train_loss,"Train_KL_Loss":avg_train_kl, "Train_Dice_Loss":avg_train_dice ,"Epoch": epoch + 1})
 
     avg_val_loss = val_loss / len(val_loader)
     avg_val_kl = val_kl / len(val_loader)
     avg_val_dice = val_dice / len(val_loader)
-    wandb.log({"Train Loss": avg_val_loss,"Train_KL_Loss":avg_val_kl, "Train_Dice_Loss":avg_val_dice "Epoch": epoch + 1})
+    wandb.log({"Val Loss": avg_val_loss,"Val_KL_Loss":avg_val_kl, "Val_Dice_Loss":avg_val_dice ,"Epoch": epoch + 1})
 
     print(f"\n[Epoch {epoch+1}] Train Loss: {avg_train_loss:.6f}, Train KL: {avg_train_kl:.6f}, Train Dice: {avg_train_dice:.6f}")
     print(f"[Epoch {epoch+1}] Val Loss: {avg_val_loss:.6f}, Val KL: {avg_val_kl:.6f}, Val Dice: {avg_val_dice:.6f}")
