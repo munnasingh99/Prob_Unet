@@ -14,7 +14,8 @@ class DownConvBlock(nn.Module):
         layers = []
 
         if pool:
-            layers.append(nn.AvgPool2d(kernel_size=2, stride=2, padding=0, ceil_mode=True))
+            #layers.append(nn.AvgPool2d(kernel_size=2, stride=2, padding=0, ceil_mode=True))
+            layers.append(nn.AdaptiveAvgPool2d((None, None)))
 
         layers.append(nn.Conv2d(input_dim, output_dim, kernel_size=3, stride=1, padding=int(padding)))
         layers.append(nn.ReLU(inplace=True))
@@ -46,14 +47,34 @@ class UpConvBlock(nn.Module):
 
         self.conv_block = DownConvBlock(input_dim, output_dim, initializers, padding, pool=False)
 
+    # def forward(self, x, bridge):
+    #     if self.bilinear:
+    #         up = nn.functional.interpolate(x, mode='bilinear', scale_factor=2, align_corners=True)
+    #     else:
+    #         up = self.upconv_layer(x)
+        
+    #     assert up.shape[3] == bridge.shape[3]
+    #     out = torch.cat([up, bridge], 1)
+    #     out =  self.conv_block(out)
+
+    #     return out
+
     def forward(self, x, bridge):
+        # if self.bilinear:
+        #     up = nn.functional.interpolate(x, size=bridge.shape[2:], mode='bilinear', align_corners=True)
+        # else:
+        #     up = self.upconv_layer(x)
         if self.bilinear:
-            up = nn.functional.interpolate(x, mode='bilinear', scale_factor=2, align_corners=True)
+            up = nn.functional.interpolate(x, size=bridge.shape[2:], mode='bilinear', align_corners=True)
         else:
             up = self.upconv_layer(x)
-        
-        assert up.shape[3] == bridge.shape[3]
-        out = torch.cat([up, bridge], 1)
-        out =  self.conv_block(out)
 
+        # Instead of assert, handle mismatches dynamically
+        diffY = bridge.size()[2] - up.size()[2]
+        diffX = bridge.size()[3] - up.size()[3]
+
+        up = nn.functional.pad(up, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+
+        out = torch.cat([up, bridge], 1)
+        out = self.conv_block(out)
         return out

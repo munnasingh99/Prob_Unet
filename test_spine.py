@@ -74,9 +74,7 @@ with torch.no_grad():
 
     for idx, slice_img in progress_bar:
         # Normalize & Convert to Tensor
-        padded_slice = pad_image(slice_img, pad_h, pad_w)
-        print(padded_slice.shape)
-        slice_tensor = transform(padded_slice).unsqueeze(0).to(device)  # Add batch dimension
+        slice_tensor = transform(slice_img).unsqueeze(0).to(device)   # Add batch dimension
         # Forward Pass
         model.forward(slice_tensor,None,training=False)
         pred_logits = model.sample()

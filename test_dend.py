@@ -9,8 +9,9 @@ import torchvision.transforms as transforms
 
 # 🔹 Paths
 tif_file_path = "DeepD3_Benchmark.tif"  # Update with your TIF file path
-model_path = "saved_models/dend_model_epoch_24_dice_0.7335.pth"  # Load trained model
-output_dir = "benchmark_predictions_dend/"
+model_path = "saved_models/spine_model_epoch_7_dice_0.6390.pth"  # Load trained model
+#model_path = "saved_models/spine_model_epoch_4_dice_0.6411.pth"
+output_dir = "sampling_probabilities_spine/"
 os.makedirs(output_dir, exist_ok=True)
 
 # 🔹 Model & Device
@@ -66,32 +67,78 @@ def save_image(image, filename):
 #     return image[start_y:start_y + crop_size, start_x:start_x + crop_size]
 
 # 🔹 Inference Loop
+
+def save_probability_maps(image, pred_prob,sample_idx):
+    """
+    Saves input image, ground truth mask, and predicted probability map.
+
+    Args:
+        pred_prob (torch.Tensor): Predicted probability map
+        sample_idx (int): Sample index (for multiple outputs per image)
+    """
+    image = image.squeeze(0).cpu().detach().numpy()
+    #mask = mask.squeeze(0).cpu().detach().numpy()
+    pred_prob = pred_prob.squeeze(0).squeeze(0).cpu().detach().numpy()  # Keep probabilities (not binarized)
+
+    # Normalize image for saving
+    image = (image * 255).astype(np.uint8)
+    #mask = (mask > 0.5).astype(np.uint8) * 255
+
+    # Normalize probability map (0 to 255 for saving)
+    prob_map_scaled = (pred_prob * 255).astype(np.uint8)
+
+    # Save images
+    filename_i = f"image.png"
+    #filename_m = f"{mode}_{epoch}_{batch_idx}_mask.png"
+    filename_p = f"sample_{sample_idx}_prob_map.png"
+
+    cv2.imwrite(os.path.join(output_dir, filename_i), image)
+    #cv2.imwrite(os.path.join(output_dir, filename_m), mask)
+    cv2.imwrite(os.path.join(output_dir, filename_p), prob_map_scaled)
+
+    # Save probability maps as raw numpy arrays for further analysis
+    npy_filename = f"sample_{sample_idx}_prob_map.npy"
+    np.save(os.path.join(output_dir, npy_filename), pred_prob)
+
+    print(f"Saved: {filename_i}, {filename_p}, {npy_filename}")
+
+
 total_dice = 0.0
 num_slices = len(tif_stack)
 print(f"Tif Stack shape is: {tif_stack[0].shape}")
 with torch.no_grad():
-    progress_bar = tqdm(enumerate(tif_stack), total=num_slices, desc="Benchmark Testing")
+    # progress_bar = tqdm(enumerate(tif_stack), total=num_slices, desc="Benchmark Testing")
 
-    for idx, slice_img in progress_bar:
-        # Normalize & Convert to Tensor
-        padded_slice = pad_image(slice_img, pad_h, pad_w)
-        print(padded_slice.shape)
-        slice_tensor = transform(padded_slice).unsqueeze(0).to(device)  # Add batch dimension
-        # Forward Pass
-        model.forward(slice_tensor,None,training=False)
-        pred_logits = model.sample()
+    # for idx, slice_img in progress_bar:
+    #     # Normalize & Convert to Tensor
+    #     #padded_slice = pad_image(slice_img, pad_h, pad_w)
+    #     #print(padded_slice.shape)
+    #     slice_tensor = transform(slice_img).unsqueeze(0).to(device)  # Add batch dimension
+    #     # Forward Pass
+    #     model.forward(slice_tensor,None,training=False)
+    #     pred_logits = model.sample()
 
-        # Compute Prediction
-        pred_probs = torch.sigmoid(pred_logits) 
-        print(pred_probs.shape) # Convert logits to probabilities
-        pred_binary = (pred_probs > 0.5).float().squeeze(0).squeeze(0).cpu().numpy()  # Convert to NumPy
-        print(f"After numpy transfrom: {pred_binary.shape}")
-        #image = slice_tensor.squeeze(0).cpu().detach().numpy()
-        # Save Prediction
-        save_image(pred_binary, f"benchmark_{idx}_prediction.png")
-        #save_image(original,f"benchmark_{idx}_stack.png")
+    #     # Compute Prediction
+    #     pred_probs = torch.sigmoid(pred_logits) 
+    #     print(pred_probs.shape) # Convert logits to probabilities
+    #     pred_binary = (pred_probs > 0.5).float().squeeze(0).squeeze(0).cpu().numpy()  # Convert to NumPy
+    #     print(f"After numpy transfrom: {pred_binary.shape}")
+    #     #image = slice_tensor.squeeze(0).cpu().detach().numpy()
+    #     # Save Prediction
+    #     save_image(pred_binary, f"benchmark_{idx}_prediction.png")
+    #     #save_image(original,f"benchmark_{idx}_stack.png")
 
-        # Update Progress
-        progress_bar.set_postfix({"Saved": f"benchmark_{idx}_prediction.png"})
+    #     # Update Progress
+    #     progress_bar.set_postfix({"Saved": f"benchmark_{idx}_prediction.png"})
 
-print("\n🔹 Benchmark Testing Completed! Predictions saved in 'benchmark_predictions_dend/'")
+    slice_tensor = transform(tif_stack[49]).unsqueeze(0).to(device)
+    model.forward(slice_tensor,None,training=False)
+    for sample_idx in range(10):
+            pred_logits = model.sample()
+            pred_probs = torch.sigmoid(pred_logits)
+            # pred_binary = (pred_probs > 0.5).float().squeeze(0).squeeze(0).cpu().numpy()
+            # save_image(pred_binary,f"Sampled_Predictions_Dend_{sample_idx}.png")
+            save_probability_maps(slice_tensor,pred_probs,sample_idx)
+
+#print("\n🔹 Benchmark Testing Completed! Predictions saved in 'benchmark_predictions_dend/'")
+print("Completed :)")
