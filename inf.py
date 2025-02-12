@@ -60,7 +60,7 @@ def run_inference(tif_path, model_path, output_dir, num_samples=10):
         for slice_idx in tqdm(range(len(tif_stack)), desc="Processing slices"):
             # Preprocess slice
             processed_slice, (orig_h, orig_w) = preprocess_image(tif_stack[slice_idx])
-            slice_tensor = transform(processed_slice).unsqueeze(0).to(device)
+            slice_tensor = transform(processed_slice.astype(np.float32)).unsqueeze(0).to(device)
             
             # Generate samples
             samples = []
