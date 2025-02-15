@@ -199,3 +199,5 @@ wandb
 *.mask
 benchmark_predictions_spine
 benchmark_predictions_dend
+*.out
+*.log
