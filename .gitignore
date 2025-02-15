@@ -191,11 +191,11 @@ saved_models
 test
 visualization_results
 wandb
-.pth 
-.tif
-.d3set
-.png 
-.sh 
-.mask
+*.pth 
+*.tif
+*.d3set
+*.png 
+*.sh 
+*.mask
 benchmark_predictions_spine
 benchmark_predictions_dend
