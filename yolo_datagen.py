@@ -88,15 +88,43 @@ class DataGeneratorDataset(Dataset):
 
     def _get_augmenter(self):
         return A.Compose([
-            A.RandomBrightnessContrast(p=0.25),
-            A.Rotate(limit=10, border_mode=cv2.BORDER_REFLECT, p=0.5),
+            # Standard augmentations (keep your existing ones)
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+            A.Rotate(limit=15, border_mode=cv2.BORDER_REFLECT, p=0.5),
             A.RandomRotate90(p=0.5),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
-            A.ElasticTransform(p=0.3, alpha=1, sigma=50, alpha_affine=30),
-            A.Blur(p=0.2),
-            A.GaussNoise(p=0.3),
-            A.RandomGamma(p=0.3)
+            
+            # Enhanced microscopy-specific augmentations
+            A.OneOf([
+                # Simulate different microscopy conditions
+                A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
+                A.GaussianBlur(blur_limit=(3, 7), p=0.5),
+                #A.MedianBlur(blur_limit=7, p=0.5),
+            ], p=0.5),
+            
+            # Simulate focus variation (critical for microscopy)
+            A.OneOf([
+                A.MotionBlur(blur_limit=7, p=0.5),
+                A.ZoomBlur(max_factor=1.5, p=0.5),
+                A.Defocus(radius=(3, 7), p=0.5)
+            ], p=0.3),
+            
+            # Morphological variations
+            A.OneOf([
+                A.ElasticTransform(alpha=120, sigma=120 * 0.05, alpha_affine=120 * 0.03, p=0.5),
+                A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+                A.OpticalDistortion(distort_limit=0.3, shift_limit=0.05, p=0.5)
+            ], p=0.3),
+            
+            # Intensity and contrast variations
+            A.OneOf([
+                A.RandomGamma(gamma_limit=(80, 120), p=0.5),
+                A.RandomBrightnessContrast(p=0.5),
+            ], p=0.5),
+            
+            # Cutout/dropout for robustness
+            A.CoarseDropout(max_holes=8, max_height=8, max_width=8, fill_value=0, p=0.3)
         ], p=1,
         additional_targets={
             'mask1': 'mask',

@@ -8,7 +8,8 @@ from ultralytics import YOLO
 import flammkuchen as fl
 import copy
 from datagen import DataGeneratorDataset
-from bb_approach import optimized_hybrid_bb
+import wandb
+
 
 # Set up GPU device if available
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -54,146 +55,104 @@ class YOLOSpineDatasetPreparation:
         self.data = self.d['data']
         self.meta = self.d['meta']
         
-    def generate_samples(self, num_samples=1000, size=(128, 128)):
+    def generate_samples(self, num_samples=3000, size=(128,128)):
         """
-        Generate samples for YOLOv8 segmentation training
-        
-        Args:
-            num_samples (int): Number of samples to generate
-            size (tuple): Size of each sample (height, width)
+        Generate YOLOv11‐seg training data:
+        - one line per spine instance
+        - format: class xc yc w h x1 y1 x2 y2 … xn yn
         """
-        # Use DataGeneratorDataset to generate samples
-        dataset = DataGeneratorDataset(
-            self.d3set_path, 
-            samples_per_epoch=num_samples,
-            size=size,
-            augment=True
-        )
-        
+        import numpy as np, cv2
+        from skimage.measure import label
+        from datagen import DataGeneratorDataset
+
+        ds = DataGeneratorDataset(self.d3set_path,
+                                  samples_per_epoch=num_samples,
+                                  size=size,
+                                  augment=True)
+
         for i in range(num_samples):
-            # Get a sample
-            image, (dendrite, spines) = dataset[i]
-            
-            # Convert tensors to numpy arrays
-            image_np = image.numpy().squeeze()
-            spines_np = spines.numpy().squeeze()
-            
-            # Handle NaN values in the image
-            if np.isnan(image_np).any():
-                image_np = np.nan_to_num(image_np)
-            
-            # Normalize image to 0-255 for saving - with NaN handling
-            image_min = np.nanmin(image_np) if not np.all(np.isnan(image_np)) else 0
-            image_max = np.nanmax(image_np) if not np.all(np.isnan(image_np)) else 1
-            
-            # Avoid division by zero
-            if image_max - image_min == 0:
-                image_uint8 = np.zeros_like(image_np, dtype=np.uint8)
+            img_t, (_, spine_t) = ds[i]
+            img = img_t.numpy().squeeze()
+            mask = (spine_t.numpy().squeeze()>0.5).astype(np.uint8)
+
+            # handle NaNs and normalize
+            img = np.nan_to_num(img)
+            mn, mx = img.min(), img.max()
+            if mx-mn < 1e-6:
+                img8 = np.zeros_like(img, np.uint8)
             else:
-                image_uint8 = (((image_np - image_min) / (image_max - image_min)) * 255).astype(np.uint8)
-            
-            # Create instance labels from spine mask using connected components
-            spine_instances, bboxes = optimized_hybrid_bb(image_np, spines_np, dendrite_np)
-            num_instances = spine_instances.max()
-            
-            # If no instances found, skip this sample
-            if num_instances == 0:
+                img8 = ((img-mn)/(mx-mn)*255).astype(np.uint8)
+
+            # RGB for YOLO
+            img8 = cv2.cvtColor(img8, cv2.COLOR_GRAY2RGB)
+
+            # your CC → each instance mask
+            instances = label(mask)
+            if instances.max()==0:
                 continue
-                
-            # Convert to RGB for YOLOv8
-            if len(image_uint8.shape) == 2:
-                image_uint8 = cv2.cvtColor(image_uint8, cv2.COLOR_GRAY2RGB)
-            
-            # Split into train/val
-            split = "train" if np.random.rand() < self.train_val_split else "val"
-            
-            # Save image
-            img_path = f"{self.output_dir}/images/{split}/{i:06d}.png"
-            cv2.imwrite(img_path, image_uint8)
-            
-            # For segmentation tasks, we need to save both bounding boxes and polygon points
-            label_path = f"{self.output_dir}/labels/{split}/{i:06d}.txt"
-            
-            # Process each spine instance and create a segmentation mask
-            with open(label_path, 'w') as f:
-                # Get properties of each labeled region
-                regions = regionprops(spine_instances)
-                
-                for region in regions:
-                    # Skip very small regions
-                    if region.area < 10:
-                        continue
-                    
-                    # Get bounding box (y_min, x_min, y_max, x_max)
-                    y_min, x_min, y_max, x_max = region.bbox
-                    
-                    # Get the mask for this specific instance
-                    instance_mask = (spine_instances == region.label)
-                    
-                    # Find contours for the mask to get polygon points
-                    contours, _ = cv2.findContours(
-                        instance_mask.astype(np.uint8), 
-                        cv2.RETR_EXTERNAL, 
-                        cv2.CHAIN_APPROX_SIMPLE
-                    )
-                    
-                    # If no contours found, skip this instance
-                    if not contours:
-                        continue
-                        
-                    # Find the largest contour
-                    largest_contour = max(contours, key=cv2.contourArea)
-                    
-                    # If contour is too small, skip
-                    if cv2.contourArea(largest_contour) < 10:
-                        continue
-                    
-                    # Simplify the contour to reduce the number of points
-                    epsilon = 0.005 * cv2.arcLength(largest_contour, True)
-                    approx = cv2.approxPolyDP(largest_contour, epsilon, True)
-                    
-                    # If we have too few points, add some intermediate points
-                    if len(approx) < 4:
-                        approx = largest_contour
-                    
-                    # Convert to YOLOv8 segmentation format
-                    # Format: class_id x1 y1 x2 y2 ... xn yn
-                    
-                    # First, calculate normalized bounding box center and dimensions (needed for YOLO)
-                    h, w = instance_mask.shape
-                    x_center = ((x_min + x_max) / 2) / w
-                    y_center = ((y_min + y_max) / 2) / h
-                    width = (x_max - x_min) / w
-                    height = (y_max - y_min) / h
-                    
-                    # Start with class id (0 for spine)
-                    line = "0"
-                    
-                    # Add normalized polygon points
-                    for point in approx.reshape(-1, 2):
-                        x, y = point
-                        line += f" {x/w} {y/h}"
-                    
-                    f.write(line + "\n")
-            
-            # Progress update
-            if (i + 1) % 100 == 0:
-                print(f"Processed {i+1}/{num_samples} samples")
+
+            split = "train" if np.random.rand()<self.train_val_split else "val"
+            out_img = f"{self.output_dir}/images/{split}/{i:06d}.png"
+            out_lbl = f"{self.output_dir}/labels/{split}/{i:06d}.txt"
+
+            cv2.imwrite(out_img, img8)
+
+            h,w = mask.shape
+            lines=[]
+            # find each instance via contour
+            for inst_id in range(1, instances.max()+1):
+                inst = (instances==inst_id).astype(np.uint8)
+                cnts,_ = cv2.findContours(inst, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not cnts:
+                    continue
+                c = max(cnts, key=cv2.contourArea)
+                if cv2.contourArea(c)<10:
+                    continue
+
+                # simplify polygon
+                eps = 0.01*cv2.arcLength(c,True)
+                poly = cv2.approxPolyDP(c, eps, True).reshape(-1,2)
+                if poly.shape[0]<3:
+                    continue
+
+                # bounding rect
+                x,y,ww,hh = cv2.boundingRect(c)
+                xc, yc = (x+ww/2)/w, (y+hh/2)/h
+                nw, nh = ww/w, hh/h
+
+                # build line
+                parts = [ "0",
+                          f"{xc:.6f}", f"{yc:.6f}",
+                          f"{nw:.6f}", f"{nh:.6f}" ]
+                for px,py in poly:
+                    parts += [ f"{px/w:.6f}", f"{py/h:.6f}" ]
+                lines.append(" ".join(parts))
+
+            # only write if at least one valid instance
+            if lines:
+                with open(out_lbl,"w") as f:
+                    f.write("\n".join(lines))
+
+            if (i+1)%100==0:
+                print(f"Processed {i+1}/{num_samples}")
+
+
     
     def create_data_yaml(self):
         """Create the dataset.yaml file for YOLOv11 segmentation training"""
         yaml_content = f"""# Dataset configuration for YOLOv11 segmentation training
-path: {os.path.abspath(self.output_dir)}
-train: images/train
-val: images/val
+        path: {os.path.abspath(self.output_dir)}
+        train: images/train
+        val: images/val
 
-# Classes
-nc: 1  # Number of classes
-names: ['spine']  # Class names
+        # Classes
+        nc: 1  # Number of classes
+        names: ['spine']  # Class names
 
-# Task (important for segmentation)
-task: segment
-"""
+        # Task (important for segmentation)
+        task: segment
+        drop_empty: False
+        """
         
         with open(f"{self.output_dir}/dataset.yaml", 'w') as f:
             f.write(yaml_content)
@@ -357,7 +316,7 @@ class SpineInstanceSegmentationPipeline:
         return image, dendrite, spines, spine_instances
 
 
-def train_yolo_for_spines(d3set_path, output_dir, epochs=300, img_size=640):
+def train_yolo_for_spines(d3set_path, output_dir, epochs=100, img_size=640):
     """
     Train YOLOv11 model for spine instance segmentation
     
@@ -370,15 +329,16 @@ def train_yolo_for_spines(d3set_path, output_dir, epochs=300, img_size=640):
     Returns:
         str: Path to the trained model
     """
+    
     # Prepare dataset
     print("Preparing dataset...")
     dataset_prep = YOLOSpineDatasetPreparation(d3set_path, f"{output_dir}/dataset")
-    dataset_prep.generate_samples(num_samples=6000)  # Increased sample count for better training
+    dataset_prep.generate_samples(num_samples=3000)  # Increased sample count for better training
     dataset_prep.create_data_yaml()
     
     # Initialize YOLOv11 model - ensure it's the segmentation variant
     print("Initializing YOLOv11 segmentation model...")
-    model = YOLO('yolo11l-seg.pt')  # Using YOLOv11 segmentation model as requested
+    model = YOLO('yolo11n-seg.pt')  # Using YOLOv11 segmentation model as requested
     
     # Set torch to use deterministic algorithms for reproducibility
     torch.backends.cudnn.deterministic = True
@@ -388,18 +348,22 @@ def train_yolo_for_spines(d3set_path, output_dir, epochs=300, img_size=640):
     print("Training YOLOv11 segmentation model on GPU...")
     model.train(
         data=f"{output_dir}/dataset/dataset.yaml",
-        epochs=epochs,
-        imgsz=img_size,
-        batch=16,
+        task='segment',
+        epochs=250,
+        imgsz=640,
+        batch=64,
+        lr0=0.005,
+        lrf=0.01,
+        cos_lr=True,
+        warmup_epochs=5,         # run name in W&B
+        exist_ok=True,                # overwrite same project/name
         patience=20,
-        save=True,
-        device=0,  # Use GPU device 0
-        workers=4,  # Adjust number of workers for your HPC environment
-        rect=True,  # Use rectangular training for small objects like spines
-        mosaic=0.5,  # Reduce mosaic augmentation to maintain small feature visibility
-        task='segment'  # Explicitly set task to segment for instance segmentation
+        rect=True,
+        multi_scale=True,
+        copy_paste=0.5,
+        mixup=0.2,
+        mosaic=0.5,  # Explicitly set task to segment for instance segmentation
     )
-    
     
     best = model.best  # this is a pathlib.Path to the best.pt file
     print(f"✅ Training complete. Best model: {best}")
@@ -434,24 +398,24 @@ def visualize_results(image, dendrite_mask, spine_mask, spine_instances, output_
     # Plot
     plt.figure(figsize=(18, 12))
 
-    plt.subplot(2, 2, 1)
+    plt.subplot(1, 4, 1)
     plt.imshow(image_norm, cmap='gray')
     plt.title('Original Image')
     plt.axis('off')
 
-    plt.subplot(2, 2, 2)
+    plt.subplot(1, 4, 2)
     plt.imshow(image_norm, cmap='gray')
     plt.imshow(dendrite_mask, alpha=0.5, cmap='Blues')
     plt.title('Dendrite Segmentation')
     plt.axis('off')
 
-    plt.subplot(2, 2, 3)
+    plt.subplot(1, 4, 3)
     plt.imshow(image_norm, cmap='gray')
     plt.imshow(spine_mask, alpha=0.5, cmap='Reds')
     plt.title('Spine Segmentation')
     plt.axis('off')
 
-    plt.subplot(2, 2, 4)
+    plt.subplot(1, 4, 4)
     plt.imshow(image_norm, cmap='gray')
     plt.imshow(instance_vis, alpha=0.7, cmap=instance_cmap)
     plt.title(f'Spine Instances ({len(spine_instances)} detected)')
@@ -496,7 +460,7 @@ if __name__ == "__main__":
     pipeline = SpineInstanceSegmentationPipeline(d3set_path, best_model_path)
     
     # Step 3: Process a few samples
-    for i in range(5):
+    for i in range(100):
         # Process sample
         image, dendrite, spines, spine_instances = pipeline.process_sample(i)
         
