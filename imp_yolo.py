@@ -8,6 +8,7 @@ from ultralytics import YOLO
 import flammkuchen as fl
 import copy
 from datagen import DataGeneratorDataset
+from bb_approach import optimized_hybrid_bb
 
 # Set up GPU device if available
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -169,7 +170,8 @@ class YOLOSpineDatasetPreparation:
             image_uint8 = preprocess_image(image_np.copy())
             
             # Create instance labels from spine mask using connected components
-            spine_instances = label(spines_np > 0.5)
+            #spine_instances = label(spines_np > 0.5)
+            spine_instances, bboxes = optimized_hybrid_bb(image_np, spines_np, dendrite_np)
             num_instances = spine_instances.max()
             
             # If no instances found, skip this sample

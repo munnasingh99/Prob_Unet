@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 from ultralytics import YOLO
 import flammkuchen as fl
 import copy
-from yolo_datagen import DataGeneratorDataset
+from datagen import DataGeneratorDataset
 from bb_approach import optimized_hybrid_bb
 
 # Set up GPU device if available
@@ -26,6 +26,201 @@ except ImportError as e:
     print("Checking available modules in ultralytics...")
     import ultralytics
     print(dir(ultralytics))
+
+def adaptive_contour_extraction(instance_mask, min_area=10, min_points=4):
+    """
+    Extract contours with adaptive refinement based on spine size and shape
+    
+    Args:
+        instance_mask (np.ndarray): Binary mask of the spine instance
+        min_area (int): Minimum contour area to consider
+        min_points (int): Minimum number of points in resulting contour
+        
+    Returns:
+        np.ndarray: Extracted contour points or None if invalid
+    """
+    # Get raw contours
+    contours, _ = cv2.findContours(
+        instance_mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_TC89_KCOS  # Better for biological shapes than SIMPLE
+    )
+    
+    if not contours:
+        return None
+    
+    # Find largest contour by area
+    largest_contour = max(contours, key=cv2.contourArea)
+    contour_area = cv2.contourArea(largest_contour)
+    
+    if contour_area < min_area:
+        return None
+    
+    # Adaptive epsilon based on spine size and perimeter
+    perimeter = cv2.arcLength(largest_contour, True)
+    area_factor = np.sqrt(contour_area) / 10  # Scale factor based on spine size
+    
+    # Smaller spines need gentler approximation
+    if contour_area < 50:
+        epsilon = 0.002 * perimeter * area_factor
+    else:
+        epsilon = 0.005 * perimeter * area_factor
+    
+    # Apply polygon approximation
+    approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+    
+    # Ensure minimum number of points for YOLO
+    if len(approx) < min_points:
+        # For small contours, use more points from original
+        if contour_area < 30:
+            # Use more points for small spines to preserve shape
+            epsilon = 0.001 * perimeter
+            approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+            
+            # If still too few points, add corners of bounding rect
+            if len(approx) < min_points:
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                corners = np.array([
+                    [[x, y]],
+                    [[x + w, y]],
+                    [[x + w, y + h]],
+                    [[x, y + h]]
+                ])
+                # Combine with existing points and remove duplicates
+                approx = np.vstack([approx, corners])
+                # Remove duplicate points
+                approx = np.unique(approx.reshape(-1, 2), axis=0).reshape(-1, 1, 2)
+    
+    return approx
+
+def get_attachment_aware_contour(instance_mask, dendrite_mask):
+    """
+    Extract contour with awareness of attachment point to dendrite
+    
+    Args:
+        instance_mask (np.ndarray): Binary mask of the spine instance
+        dendrite_mask (np.ndarray): Binary mask of the dendrite
+        
+    Returns:
+        np.ndarray: Contour points considering dendrite attachment
+    """
+    # Basic contour extraction
+    contour = adaptive_contour_extraction(instance_mask)
+    if contour is None:
+        return None
+        
+    # Find attachment region
+    from skimage.morphology import binary_dilation
+    attachment_region = instance_mask & binary_dilation(dendrite_mask)
+    
+    if not np.any(attachment_region):
+        # No clear attachment, return regular contour
+        return contour
+    
+    # Get contour of attachment region
+    attach_contours, _ = cv2.findContours(
+        attachment_region.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_TC89_KCOS
+    )
+    
+    if not attach_contours:
+        return contour
+    
+    # Find largest attachment contour
+    attach_contour = max(attach_contours, key=cv2.contourArea)
+    
+    # Get centroid of attachment region
+    M = cv2.moments(attach_contour)
+    if M["m00"] == 0:
+        return contour
+        
+    cx = int(M["m10"] / M["m00"])
+    cy = int(M["m01"] / M["m00"])
+    attachment_point = np.array([[cx, cy]])
+    
+    # Find closest point on spine contour to attachment centroid
+    min_dist = float('inf')
+    closest_idx = 0
+    
+    for i, point in enumerate(contour.reshape(-1, 2)):
+        dist = np.sum((point - attachment_point)**2)
+        if dist < min_dist:
+            min_dist = dist
+            closest_idx = i
+    
+    # Ensure attachment point is included in final contour
+    # This helps preserve the biologically significant connection point
+    final_contour = contour.reshape(-1, 1, 2)
+    
+    # If attachment point isn't already in contour, add it
+    attachment_present = False
+    for point in final_contour:
+        if np.linalg.norm(point.reshape(-1) - attachment_point.reshape(-1)) < 2:
+            attachment_present = True
+            break
+            
+    if not attachment_present:
+        # Insert attachment point near closest point
+        new_contour = np.insert(
+            final_contour, 
+            closest_idx + 1, 
+            attachment_point.reshape(-1, 1, 2), 
+            axis=0
+        )
+        return new_contour
+    
+    return final_contour
+
+def spine_aware_contour_extraction(image_np, instance_mask, dendrite_mask):
+    """
+    Extract contours with awareness of spine morphology and dendrite attachment
+    
+    Args:
+        image_np (np.ndarray): Original image
+        instance_mask (np.ndarray): Binary mask of the spine instance
+        dendrite_mask (np.ndarray): Binary mask of the dendrite
+        
+    Returns:
+        np.ndarray: Extracted contour points considering morphology
+    """
+    # Try attachment-aware approach first
+    contour = get_attachment_aware_contour(instance_mask, dendrite_mask)
+    if contour is not None and len(contour) >= 4:
+        return contour
+    
+    # Fall back to adaptive extraction if attachment approach fails
+    contour = adaptive_contour_extraction(instance_mask)
+    if contour is not None and len(contour) >= 4:
+        return contour
+    
+    # Last resort: basic contour extraction
+    contours, _ = cv2.findContours(
+        instance_mask.astype(np.uint8),
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+    
+    if not contours:
+        return None
+        
+    largest_contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest_contour) < 10:
+        return None
+        
+    # Ensure we have at least 4 points
+    if len(largest_contour) < 4:
+        # Add corners of bounding rect
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        corners = np.array([
+            [[x, y]],
+            [[x + w, y]],
+            [[x + w, y + h]],
+            [[x, y + h]]
+        ])
+        return corners
+    
+    return largest_contour
 
 class YOLOSpineDatasetPreparation:
     """Helper class to convert DeepD3 dataset to YOLOv11 segmentation format for instance segmentation"""
@@ -54,7 +249,7 @@ class YOLOSpineDatasetPreparation:
         self.data = self.d['data']
         self.meta = self.d['meta']
     
-    def generate_samples(self, num_samples=1000, size=(480, 480)):
+    def generate_samples(self, num_samples=1000, size=(128, 128)):
         """
         Generate samples for YOLOv11 segmentation training with optimized instance separation
         """
@@ -145,45 +340,29 @@ class YOLOSpineDatasetPreparation:
                         if not np.any(instance_mask):
                             continue
                         
-                        # Find contours for the mask to get polygon points
-                        contours, _ = cv2.findContours(
-                            instance_mask.astype(np.uint8), 
-                            cv2.RETR_EXTERNAL, 
-                            cv2.CHAIN_APPROX_SIMPLE
+                        # Use improved spine-aware contour extraction
+                        contour = spine_aware_contour_extraction(
+                            image_np, 
+                            instance_mask, 
+                            dendrite_np
                         )
                         
-                        # If no contours found, skip this instance
-                        if not contours:
+                        # Skip if no valid contour found
+                        if contour is None or len(contour) < 4:
                             continue
                             
-                        # Find the largest contour
-                        largest_contour = max(contours, key=cv2.contourArea)
-                        
-                        # If contour is too small, skip
-                        if cv2.contourArea(largest_contour) < 10:
-                            continue
-                        
-                        # Simplify the contour to reduce the number of points
-                        epsilon = 0.005 * cv2.arcLength(largest_contour, True)
-                        approx = cv2.approxPolyDP(largest_contour, epsilon, True)
-                        
-                        # If we have too few points, add some intermediate points
-                        if len(approx) < 4:
-                            approx = largest_contour
-                        
-                        # First, calculate normalized bounding box center and dimensions
+                        # Get image dimensions
                         h, w = instance_mask.shape
-                        x_center = ((x_min + x_max) / 2) / w
-                        y_center = ((y_min + y_max) / 2) / h
-                        width = (x_max - x_min) / w
-                        height = (y_max - y_min) / h
                         
                         # Start with class id (0 for spine)
                         line = "0"
                         
                         # Add normalized polygon points
-                        for point in approx.reshape(-1, 2):
+                        for point in contour.reshape(-1, 2):
                             x, y = point
+                            # Ensure points are within image bounds
+                            x = max(0, min(x, w-1))
+                            y = max(0, min(y, h-1))
                             line += f" {x/w} {y/h}"
                         
                         f.write(line + "\n")
@@ -339,37 +518,9 @@ class SpineInstanceSegmentationPipeline:
                         spine_instances.append(instance_mask)
         
         return image, dendrite, spines, spine_instances
-        # Get detected spine instances
-        spine_instances = []
-        if len(results) > 0 and hasattr(results[0], 'boxes'):
-            boxes = results[0].boxes
-            
-            # Process each detected spine
-            for i in range(len(boxes)):
-                box = boxes[i].xyxy.cpu().numpy()[0]  # Get box coordinates (x1, y1, x2, y2)
-                conf = boxes[i].conf.cpu().numpy()[0]  # Get confidence
-                
-                # Skip low confidence detections
-                if conf < 0.25:  # Adjust threshold as needed
-                    continue
-                
-                # Create a binary mask for this instance
-                instance_mask = np.zeros_like(image_np, dtype=bool)
-                
-                # Convert box coordinates to integers
-                x1, y1, x2, y2 = box.astype(int)
-                
-                # Apply segmentation mask to get the actual spine shape within the box
-                # Only include pixels that are part of the spine segmentation
-                spines_np = spines.numpy().squeeze()
-                instance_mask[y1:y2, x1:x2] = spines_np[y1:y2, x1:x2] > 0.5
-                
-                spine_instances.append(instance_mask)
-        
-        return image, dendrite, spines, spine_instances
 
 
-def train_yolo_for_spines(d3set_path, output_dir, epochs=180, img_size=640):
+def train_yolo_for_spines(d3set_path, output_dir, epochs=300, img_size=128):
     """
     Train YOLOv11 model for spine instance segmentation
     
@@ -385,7 +536,7 @@ def train_yolo_for_spines(d3set_path, output_dir, epochs=180, img_size=640):
     # Prepare dataset
     print("Preparing dataset...")
     dataset_prep = YOLOSpineDatasetPreparation(d3set_path, f"{output_dir}/dataset")
-    dataset_prep.generate_samples(num_samples=8000)  # Increased sample count for better training
+    dataset_prep.generate_samples(num_samples=6000)  # Increased sample count for better training
     dataset_prep.create_data_yaml()
     
     # Initialize YOLOv11 model - ensure it's the segmentation variant
@@ -434,11 +585,11 @@ def visualize_results(image, dendrite_mask, spine_mask, spine_instances, output_
 
     # Build an RGBA colormap: first entry fully transparent, then tab20 colors
     base_cmap = plt.cm.get_cmap('tab20', len(spine_instances))
-    # (0,0,0,0) means “nothing drawn” for background
+    # (0,0,0,0) means "nothing drawn" for background
     rgba_list = [(0, 0, 0, 0)] + [base_cmap(i) for i in range(len(spine_instances))]
     instance_cmap = ListedColormap(rgba_list)
 
-    # Create an "instance map" where each pixel’s value = instance index (0 = background)
+    # Create an "instance map" where each pixel's value = instance index (0 = background)
     instance_vis = np.zeros_like(image, dtype=int)
     for idx, inst in enumerate(spine_instances, start=1):
         instance_vis[inst] = idx
